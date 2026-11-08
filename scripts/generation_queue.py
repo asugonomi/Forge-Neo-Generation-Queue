@@ -68,15 +68,36 @@ def after_component(component, **kwargs):
 def fingerprint():
     # Conservative guard: common Settings changes pause the next reservation, never
     # restore the entire global configuration behind the user's back.
-    ignored = {OPTION, "sd_checkpoint_hash", "quicksettings_list"}
+    ignored = {OPTION, "sd_checkpoint_hash", "quicksettings_list", "sd_model_checkpoint", "forge_additional_modules", "forge_unet_storage_dtype"}
     config_path = getattr(shared, "config_filename", None)
     # Native per-job Override settings temporarily alter opts.data. Compare the
     # saved user configuration so another job cannot capture those temporary values.
     data = json.loads(Path(config_path).read_text(encoding="utf-8")) if config_path else shared.opts.data.copy()
-    values = {k: v for k, v in data.items() if k not in ignored}
+    values = {k: v for k, v in data.items() if k not in ignored and not k.startswith(("tac_", "tacjp_", "tacp_", "forge_checkpoint_", "forge_additional_modules_"))}
     styles = getattr(getattr(shared, "prompt_styles", None), "styles", {})
     raw = json.dumps([values, styles], ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def capture_model(name, modules, dtype):
+    from modules import sd_models
+    from modules_forge import main_entry
+    checkpoint = sd_models.checkpoint_aliases.get(name)
+    if checkpoint is None:
+        raise ValueError(f"Unknown queued checkpoint: {name}")
+    if dtype not in main_entry.forge_unet_storage_dtype_options:
+        raise ValueError(f"Unknown queued model precision: {dtype}")
+    storage_dtype, online_lora = main_entry.forge_unet_storage_dtype_options[dtype]
+    paths = []
+    for value in modules or []:
+        path = main_entry.module_list.get(Path(value).name)
+        if not path:
+            raise ValueError(f"Unknown queued VAE/text encoder: {value}")
+        paths.append(str(path))
+    paths.sort()
+    return dict(sd_model_checkpoint=checkpoint.name, forge_additional_modules=paths,
+                forge_unet_storage_dtype=dtype, online_lora=online_lora or checkpoint.filename.lower().endswith(".gguf"),
+                loading=dict(checkpoint_info=checkpoint, additional_modules=paths.copy(), unet_storage_dtype=storage_dtype))
 
 
 def owner_for(token, request):
@@ -111,7 +132,15 @@ def execute(job, engine):
 
         def generate():
             try:
-                result = txt2img.txt2img(job.id, job.context, *job.args)
+                def render():
+                    from modules.queued_model_scope import selection
+                    token = selection.set(job.model_selection.copy())
+                    try:
+                        return txt2img.txt2img_function(job.id, job.context, *job.args)
+                    finally:
+                        selection.reset(token)
+
+                result = main_thread.run_and_wait_result(render)
                 if result is None:
                     raise RuntimeError(main_thread.last_exception or "Could not retrieve the generation result.")
                 return result
@@ -167,6 +196,7 @@ def install(demo, app):
     def route(original):
         @wraps(original)
         def routed(id_task, request: gr.Request, *args):
+            args, model_inputs = args[:-3], args[-3:]
             if not isinstance(id_task, str) or not id_task.startswith("fq:"):
                 if engine.has_work():
                     gr.Warning(translate("Wait for the accepted queue jobs to finish."))
@@ -181,7 +211,7 @@ def install(demo, app):
                     raise ValueError("Invalid job ID.")
                 if engine.has_work() and engine.paused:
                     raise ValueError("The queue is paused. Resume it or cancel pending jobs.")
-                engine.enqueue(f"task(fq-{nonce})", owner, args, request, fingerprint())
+                engine.enqueue(f"task(fq-{nonce})", owner, args, request, fingerprint(), capture_model(*model_inputs))
             except (ValueError, TypeError, OSError) as exc:
                 gr.Warning(translate(str(exc)))
             return tuple(gr.skip() for _ in range(5))
@@ -216,7 +246,11 @@ def install(demo, app):
     poll_events[0].outputs = [ui["status"], *candidates[0].outputs]
     for fn in candidates:
         fn.fn = route(fn.fn)
-        fn.js = "(...args) => window.forgeGenerationQueue.submit(...args)"
+        from modules_forge import main_entry
+        count = len(fn.inputs)
+        fn.inputs = [*fn.inputs, main_entry.ui_checkpoint, main_entry.ui_vae, main_entry.ui_forge_unet_dtype]
+        fn.js = ("async (...args) => {const model = args.splice(" + str(count) + ", 3); "
+                 "return [...await window.forgeGenerationQueue.submit(...args), ...model];}")
         fn.trigger_mode = "multiple"
         fn.concurrency_limit = 1
         fn.concurrency_id = "forge_generation_queue_submit"

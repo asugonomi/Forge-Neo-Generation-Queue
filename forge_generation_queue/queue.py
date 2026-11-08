@@ -23,6 +23,7 @@ class Job:
     context: object
     fingerprint: str
     label: str
+    model_selection: object = None
     state: str = "pending"
     cancel_requested: bool = False
     error: str = ""
@@ -42,7 +43,7 @@ class GenerationQueue:
         self.closed = False
         self.worker = None
 
-    def enqueue(self, job_id, owner, args, context, fingerprint):
+    def enqueue(self, job_id, owner, args, context, fingerprint, model_selection=None):
         with self.cv:
             if self.closed:
                 raise ValueError("The UI is reloading. Reload the page.")
@@ -61,7 +62,7 @@ class GenerationQueue:
                 raise ValueError("Too many clients have pending results. Reconnect those tabs or wait 30 minutes.")
             self.serial += 1
             job = Job(job_id, owner, self.serial, deepcopy(tuple(args)), context,
-                      fingerprint, str(args[0])[:100] if args else "")
+                      fingerprint, str(args[0])[:100] if args else "", model_selection)
             self.jobs[job_id] = job
             self._trim()
             if self.worker is None or not self.worker.is_alive():

@@ -1,3 +1,5 @@
+> **asugonomi modification fork:** [日本語の変更点・導入・検証範囲](README_MODIFICATIONS.md) / [Reversible installer](https://github.com/asugonomi/ForgeNeoModification). Based on `28f26fc67d9c`.
+
 # Forge Neo Generation Queue
 
 [日本語 README](README.ja.md)
